@@ -64,36 +64,39 @@ def train_test_split_time_series(df: pd.DataFrame, test_size: float = 0.2):
 def main(cfg: DictConfig):
 
     processed_dir = cfg.data.processed_dir
-    tickers = cfg.data.tickers
-    horizon = cfg.features.prediction_horizon
-    target_col = f"target_{horizon}d"
+    aligned_path = os.path.join(processed_dir, "filing_aligned.csv")
 
-    # Load Data
-    logger.info("Loading processed data...")
-    df = load_processed_data(processed_dir, tickers)
+    # Load filing-aligned data
+    logger.info("Loading filing-aligned dataset...")
+    df = pd.read_csv(aligned_path, parse_dates=["filed_at"])
+    logger.info(f"Total rows: {len(df)}, Tickers: {df['ticker'].nunique()}")
 
-    # Identify Features (All numeric columns except target, Date, and OHLCV)
-    exclude_cols = [
-        "Date",
-        "Ticker",
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-        "Adj Close",
-        target_col,
-    ]
+    # Features and target
     feature_cols = [
-        c for c in df.columns if c not in exclude_cols and not c.startswith("target_")
+        # Text features
+        "cosine_sim_prev",
+        "sentiment_compound", "sentiment_pos", "sentiment_neg",
+        "text_length_norm",
+        # Price features at filing date
+        "price_return_1d", "price_return_5d", "price_return_20d",
+        "price_volatility_20d", "price_ma_ratio_5", "price_ma_ratio_20",
+        "price_rsi",
     ]
+    target_col = "target"
 
-    logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
+    # Drop rows with any NaN in features
+    df = df.dropna(subset=feature_cols + [target_col])
+    logger.info(f"After dropna: {len(df)} rows")
+    logger.info(f"Using features: {feature_cols}")
 
-    # Train/Test Split
-    train_df, test_df = train_test_split_time_series(
-        df, test_size=cfg.training.test_size
-    )
+    # Time-series split
+    df = df.sort_values("filed_at").reset_index(drop=True)
+    split_idx = int(len(df) * (1 - cfg.training.test_size))
+    split_date = df.iloc[split_idx]["filed_at"]
+    logger.info(f"Splitting at index {split_idx} (date: {split_date})")
+
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
 
     X_train = train_df[feature_cols]
     y_train = train_df[target_col]
@@ -103,37 +106,34 @@ def main(cfg: DictConfig):
     logger.info(f"Training set: {len(X_train)} samples")
     logger.info(f"Test set: {len(X_test)} samples")
 
-    # Scaling
+    # Scale
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Model Selection
+    # Train
     model_type = cfg.model.type
     if model_type == "logistic_regression":
         model = LogisticRegression(**cfg.model.params)
     elif model_type == "random_forest":
-        # Convert omegaconf to dict
         params = dict(cfg.model.params) if cfg.model.params else {}
         model = RandomForestClassifier(**params, random_state=cfg.seed)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    # Training
     logger.info(f"Training {model_type}...")
     model.fit(X_train_scaled, y_train)
 
-    # Evaluation
+    # Evaluate
     y_pred = model.predict(X_test_scaled)
     acc = accuracy_score(y_test, y_pred)
-
     logger.info(f"Test Accuracy: {acc:.4f}")
     logger.info("\nClassification Report:\n" + classification_report(y_test, y_pred))
 
-    # Save Model
+    # Save
     os.makedirs("models", exist_ok=True)
     joblib.dump(model, f"models/baseline_{model_type}.pkl")
-    joblib.dump(scaler, f"models/scaler.pkl")
+    joblib.dump(scaler, "models/scaler.pkl")
     logger.info("Model saved to models/")
 
 

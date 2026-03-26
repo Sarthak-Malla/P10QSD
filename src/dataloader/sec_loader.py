@@ -21,7 +21,6 @@ def _get_company_filings(
     cik_or_name: str, form: str, start: str, end: str
 ) -> Optional[EntityFilings]:
     """Fetch filings for a company within a date range."""
-
     try:
         company = Company(cik_or_name)
         filings = company.get_filings(form=form, filing_date=f"{start}:{end}")
@@ -36,7 +35,6 @@ def _get_company_filings(
 
 def _extract_section_text(doc, section_name: str) -> Optional[str]:
     """Extract section text (e.g. Item 1A) from a filing document."""
-
     try:
         section = doc.get_section(section_name)
         if section:
@@ -54,9 +52,52 @@ def _configure_cache(cache_dir: str) -> None:
 
     httpclient.get_cache_directory = get_cache_directory
 
+
 def _get_document_entity(filing):
     doc = filing.obj()
     return doc.document
+
+
+def _extract_section_with_fallback(filing, sections: list) -> dict:
+    """Try section extraction, fall back to chunked full text if all sections are empty."""
+    try:
+        doc = _get_document_entity(filing)
+        section_texts = {}
+
+        if hasattr(doc, "get_section"):
+            for section in sections:
+                text = _extract_section_text(doc, section)
+                section_texts[f"section_{section}"] = text
+
+        # If all sections are None/empty, fall back to full document text
+        if not any(section_texts.values()):
+            logger.info("Section extraction failed, falling back to full text search")
+            try:
+                full_text = doc.text(clean=True, include_tables=False, table_max_col_width=200)
+                for section in sections:
+                    keywords = ["ITEM 1A", "Item 1A", "RISK FACTORS", "Risk Factors"]
+                    start_idx = -1
+                    for kw in keywords:
+                        idx = full_text.find(kw)
+                        if idx != -1:
+                            start_idx = idx
+                            break
+
+                    if start_idx != -1:
+                        # Take up to 15000 chars from that point (typical Item 1A length)
+                        section_texts[f"section_{section}"] = full_text[start_idx:start_idx + 15000]
+                        logger.info("Fallback succeeded for section %s", section)
+                    else:
+                        section_texts[f"section_{section}"] = None
+                        logger.warning("Fallback could not find section %s in full text", section)
+            except Exception as exc:
+                logger.warning("Full text fallback also failed: %s", exc)
+
+        return section_texts
+    except Exception as exc:
+        logger.error("Document extraction failed: %s", exc)
+        return {f"section_{s}": None for s in sections}
+
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -64,7 +105,14 @@ def main(cfg: DictConfig) -> None:
     _configure_cache(cache_dir)
     set_identity(cfg.sec.identity)
 
-    tickers = cfg.data.tickers
+    # Load tickers from file
+    tickers_file = cfg.data.tickers_file
+    if not os.path.exists(tickers_file):
+        raise FileNotFoundError(f"Tickers file not found: {tickers_file}")
+    with open(tickers_file) as f:
+        tickers = [line.strip() for line in f if line.strip()]
+    logger.info(f"Loaded {len(tickers)} tickers from {tickers_file}")
+
     start_date = cfg.data.start_date
     end_date = cfg.data.end_date
     raw_dir = os.path.join(cfg.data.raw_dir, "sec_filings")
@@ -84,29 +132,8 @@ def main(cfg: DictConfig) -> None:
 
             for filing in filings:
                 try:
-                    doc = _get_document_entity(filing)
-                    text_content = None
-                    section_texts = {}
+                    section_texts = _extract_section_with_fallback(filing, sections)
 
-                    if hasattr(doc, "get_section"):
-                        for section in sections:
-                            section_texts[f"section_{section}"] = _extract_section_text(
-                                doc, section
-                            )
-
-                        # Fallback to full text if no specific sections
-                        if not any(section_texts.values()):
-                            text_content = doc.text(
-                                clean=True, include_tables=True, table_max_col_width=500
-                            )
-                    else:
-                        logger.warning(
-                            "Document for %s does not support section extraction",
-                            ticker,
-                        )
-                        text_content = doc.text(
-                                clean=True, include_tables=True, table_max_col_width=500
-                                )
                     record = {
                         "ticker": ticker,
                         "cik": getattr(filing, "cik", None),
@@ -127,8 +154,6 @@ def main(cfg: DictConfig) -> None:
                             f"section_{section}", None
                         )
 
-                    # record["document_text"] = text_content
-
                     records.append(record)
                 except Exception as exc:
                     logger.error("Failed to process filing for %s: %s", ticker, exc)
@@ -137,6 +162,12 @@ def main(cfg: DictConfig) -> None:
             output_path = os.path.join(raw_dir, f"{ticker}_filings.parquet")
             pd.DataFrame(records).to_parquet(output_path, index=False)
             logger.info("Saved %d filings for %s", len(records), ticker)
+
+            # Log how many had successful text extraction
+            df_check = pd.DataFrame(records)
+            text_col = f"section_{sections[0]}"
+            success = df_check[text_col].notna().sum()
+            logger.info("%s: %d/%d filings have text extracted", ticker, success, len(records))
         else:
             logger.warning("No filings saved for %s", ticker)
 

@@ -3,7 +3,7 @@ seed: 42
 
 # Data configuration
 data:
-  tickers: ["AAPL", "MSFT", "GOOGL"]
+  tickers_file: "sp500_50.txt"
   start_date: "2015-01-01"
   end_date: "2024-12-31"
   raw_dir: "data/raw"
@@ -11,21 +11,20 @@ data:
 
 # Feature configuration
 features:
-  prediction_horizon: 5 # Number of days to predict ahead
-  window_sizes: [5, 10, 20, 50] # For rolling features
+  prediction_horizon: 5  # days after filing to measure return
 
 # Model configuration
 model:
-  type: "random_forest" # Options: logistic_regression, random_forest, lightgbm
+  type: "random_forest"
   params:
-    n_estimators: 100
-    max_depth: 10
-    min_samples_split: 5
+    n_estimators: 200
+    max_depth: 5
+    min_samples_split: 10
 
 # Training configuration
 training:
   test_size: 0.2
-  split_type: "time_series" # Options: time_series, random (strict NO for this project)
+  split_type: "time_series"
 
 sec:
   identity: "sarthak.malla@mbzuai.ac.ae"

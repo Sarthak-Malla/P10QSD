@@ -12,6 +12,7 @@ data:
 # Feature configuration
 features:
   prediction_horizon: 5  # days after filing to measure return
+  window_sizes: [5, 10, 20, 50] # used for price only prediction
 
 # Model configuration
 model:

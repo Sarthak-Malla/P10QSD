@@ -67,3 +67,16 @@ temp/
 **/*.csv
 
 .ruff_cache/
+# Generated data and models
+data/
+models/
+outputs/
+venv/
+.hydra/
+__pycache__/
+*.pyc
+*.pkl
+*.parquet
+conf/config.yaml.bak
+setup_upgrade.sh
+upgrade_v*.sh

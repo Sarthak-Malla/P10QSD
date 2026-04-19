@@ -1,299 +1,258 @@
 """
-filing_dataset.py
+filing_dataset.py v3
 
-Builds a filing-aligned dataset:
-- 1 row per 10-Q filing per company
-- Text features: cosine similarity vs previous quarter, VADER sentiment, text length
-- Price features: momentum, volatility, RSI, MA ratio computed AT filing date
-- Target: did stock go up in next N days after filing?
-- Saves to data/processed/filing_aligned.csv
+Key fixes vs v2:
+1. Abnormal return computed from t+1 (skip filing day noise)
+   Filing day (t=0) is dominated by algo traders reacting to headline numbers.
+   The text-driven informed reaction happens t+1 onward.
+
+2. Interaction features added:
+   - lm_neg_x_cosine: high negative sentiment AND large text change = strong signal
+   - lm_unc_x_drift:  uncertainty increasing while risk profile drifting = bad signal
+   - text_price_divergence: text sentiment opposes recent price momentum
+
+3. Multi-horizon targets stored (5d, 10d, 20d) for horizon analysis
 """
-
-import os
-import logging
+import os, logging
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import hydra
 from omegaconf import DictConfig
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from src.features.lm_features import add_lm_features
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+SECTOR_MAP = {
+    "AAPL":"Technology","MSFT":"Technology","GOOGL":"Technology","NVDA":"Technology",
+    "META":"Technology","TSLA":"Technology","CSCO":"Technology","QCOM":"Technology",
+    "INTC":"Technology","IBM":"Technology",
+    "JPM":"Finance","BAC":"Finance","GS":"Finance","WFC":"Finance","MS":"Finance",
+    "BLK":"Finance","AXP":"Finance","SPGI":"Finance","CB":"Finance","PGR":"Finance",
+    "JNJ":"Healthcare","UNH":"Healthcare","PFE":"Healthcare","ABBV":"Healthcare",
+    "MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare","DHR":"Healthcare",
+    "BMY":"Healthcare","AMGN":"Healthcare",
+    "AMZN":"Consumer","WMT":"Consumer","HD":"Consumer","MCD":"Consumer","SBUX":"Consumer",
+    "PG":"Consumer","KO":"Consumer","PEP":"Consumer","COST":"Consumer","NKE":"Consumer",
+    "CVX":"Energy","XOM":"Energy",
+    "CAT":"Industrial","UPS":"Industrial","RTX":"Industrial","NEE":"Industrial",
+    "LIN":"Industrial","BA":"Industrial","DE":"Industrial","MMM":"Industrial",
+}
 
-# ── Text features ─────────────────────────────────────────────────────────────
-
-def cosine_sim_consecutive(texts: pd.Series) -> pd.Series:
-    """
-    For each filing, compute TF-IDF cosine similarity vs the PREVIOUS filing.
-    Returns NaN for the first filing (no previous to compare).
-    """
+def cosine_sim_consecutive(texts):
     sims = [np.nan]
-    texts_list = texts.fillna("").tolist()
-
-    for i in range(1, len(texts_list)):
-        prev, curr = texts_list[i - 1], texts_list[i]
-        if not prev.strip() or not curr.strip():
-            sims.append(np.nan)
-            continue
+    tl = texts.fillna("").tolist()
+    for i in range(1, len(tl)):
+        p, c = tl[i-1], tl[i]
+        if not p.strip() or not c.strip(): sims.append(np.nan); continue
         try:
-            vec = TfidfVectorizer(max_features=5000, stop_words="english")
-            tfidf = vec.fit_transform([prev, curr])
-            sim = cosine_similarity(tfidf[0], tfidf[1])[0][0]
-            sims.append(float(sim))
-        except Exception:
-            sims.append(np.nan)
-
+            v = TfidfVectorizer(max_features=5000, stop_words="english")
+            t = v.fit_transform([p, c])
+            sims.append(float(cosine_similarity(t[0], t[1])[0][0]))
+        except: sims.append(np.nan)
     return pd.Series(sims, index=texts.index)
 
+def compute_risk_drift_4q(cosine_sims):
+    return cosine_sims.rolling(window=4, min_periods=2).mean() - cosine_sims.mean()
 
-def vader_sentiment(text: str) -> dict:
-    """VADER compound, positive, negative scores."""
-    sia = SentimentIntensityAnalyzer()
-    if not isinstance(text, str) or not text.strip():
-        return {"sentiment_compound": np.nan,
-                "sentiment_pos": np.nan,
-                "sentiment_neg": np.nan}
-    s = sia.polarity_scores(text)
-    return {"sentiment_compound": s["compound"],
-            "sentiment_pos": s["pos"],
-            "sentiment_neg": s["neg"]}
+def compute_filing_surprise(cosine_sims):
+    em = cosine_sims.expanding(min_periods=2).mean()
+    es = cosine_sims.expanding(min_periods=2).std().replace(0, np.nan)
+    return (cosine_sims - em) / es
 
+def compute_sector_contagion(df, window_days=45):
+    df = df.copy()
+    df["sector"] = df["ticker"].map(SECTOR_MAP)
+    df["filed_at"] = pd.to_datetime(df["filed_at"])
+    contagion = []
+    for idx, row in df.iterrows():
+        s = row["sector"]
+        if pd.isna(s): contagion.append(np.nan); continue
+        mask = ((df["sector"]==s) & (df["ticker"]!=row["ticker"]) &
+                (df["filed_at"] >= row["filed_at"]-pd.Timedelta(days=window_days)) &
+                (df["filed_at"] <= row["filed_at"]+pd.Timedelta(days=window_days)))
+        peers = df.loc[mask, "cosine_sim_prev"].dropna()
+        contagion.append(float(peers.mean()) if len(peers) >= 2 else np.nan)
+    return pd.Series(contagion, index=df.index)
 
-# ── Price features ────────────────────────────────────────────────────────────
+def calculate_rsi(prices, window=14):
+    if len(prices) < window+1: return np.nan
+    d = prices.diff()
+    g = d.where(d>0,0).rolling(window).mean()
+    l = (-d.where(d<0,0)).rolling(window).mean()
+    rs = g / l.replace(0, np.nan)
+    return float((100 - 100/(1+rs)).iloc[-1])
 
-def calculate_rsi(prices: pd.Series, window: int = 14) -> float:
-    """RSI at the last available price point."""
-    if len(prices) < window + 1:
-        return np.nan
-    delta = prices.diff()
-    gain = delta.where(delta > 0, 0).rolling(window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
-
-
-def get_price_features_at_filing(
-    filing_date: pd.Timestamp,
-    price_df: pd.DataFrame,
-    lookback: int = 50,
-) -> dict:
-    """
-    Compute technical features from price data BEFORE the filing date.
-    Uses up to `lookback` trading days prior to the filing.
-    """
-    empty = {
-        "price_return_1d": np.nan,
-        "price_return_5d": np.nan,
-        "price_return_20d": np.nan,
-        "price_volatility_20d": np.nan,
-        "price_ma_ratio_5": np.nan,
-        "price_ma_ratio_20": np.nan,
-        "price_rsi": np.nan,
-    }
-
+def get_price_features(filing_date, price_df, lookback=50):
+    empty = {k: np.nan for k in ["price_return_1d","price_return_5d","price_return_20d",
+                                   "price_volatility_20d","price_ma_ratio_5",
+                                   "price_ma_ratio_20","price_rsi"]}
     try:
-        closes = price_df["Close"].dropna()
-        closes.index = pd.to_datetime(closes.index)
-        closes = closes.sort_index()
-
-        # Get data up to (but not including) filing date
-        prior = closes[closes.index < filing_date]
-        if len(prior) < lookback:
-            return empty
-
-        window = prior.iloc[-lookback:]
-
-        # Returns
-        ret_1d  = float((window.iloc[-1] - window.iloc[-2]) / window.iloc[-2]) if len(window) >= 2 else np.nan
-        ret_5d  = float((window.iloc[-1] - window.iloc[-6]) / window.iloc[-6]) if len(window) >= 6 else np.nan
-        ret_20d = float((window.iloc[-1] - window.iloc[-21]) / window.iloc[-21]) if len(window) >= 21 else np.nan
-
-        # Volatility (annualized)
-        daily_returns = window.pct_change().dropna()
-        vol_20d = float(daily_returns.iloc[-20:].std() * np.sqrt(252)) if len(daily_returns) >= 20 else np.nan
-
-        # MA ratios (price / moving average)
-        ma5  = float(window.iloc[-1] / window.iloc[-5:].mean())  if len(window) >= 5  else np.nan
-        ma20 = float(window.iloc[-1] / window.iloc[-20:].mean()) if len(window) >= 20 else np.nan
-
-        # RSI
-        rsi = calculate_rsi(window)
-
+        c = price_df["Close"].dropna()
+        c.index = pd.to_datetime(c.index); c = c.sort_index()
+        prior = c[c.index < filing_date]
+        if len(prior) < lookback: return empty
+        w = prior.iloc[-lookback:]
         return {
-            "price_return_1d":    ret_1d,
-            "price_return_5d":    ret_5d,
-            "price_return_20d":   ret_20d,
-            "price_volatility_20d": vol_20d,
-            "price_ma_ratio_5":   ma5,
-            "price_ma_ratio_20":  ma20,
-            "price_rsi":          rsi,
+            "price_return_1d":    float((w.iloc[-1]-w.iloc[-2])/w.iloc[-2]) if len(w)>=2 else np.nan,
+            "price_return_5d":    float((w.iloc[-1]-w.iloc[-6])/w.iloc[-6]) if len(w)>=6 else np.nan,
+            "price_return_20d":   float((w.iloc[-1]-w.iloc[-21])/w.iloc[-21]) if len(w)>=21 else np.nan,
+            "price_volatility_20d": float(w.pct_change().dropna().iloc[-20:].std()*np.sqrt(252)) if len(w)>=21 else np.nan,
+            "price_ma_ratio_5":   float(w.iloc[-1]/w.iloc[-5:].mean()) if len(w)>=5 else np.nan,
+            "price_ma_ratio_20":  float(w.iloc[-1]/w.iloc[-20:].mean()) if len(w)>=20 else np.nan,
+            "price_rsi":          calculate_rsi(w),
         }
+    except: return empty
 
-    except Exception as e:
-        logger.warning(f"Price features failed at {filing_date}: {e}")
-        return empty
-
-
-def get_price_return_after_filing(
-    filing_date: pd.Timestamp,
-    horizon: int,
-    price_df: pd.DataFrame,
-) -> float:
-    """% price change from filing_date over next `horizon` trading days."""
+def get_abnormal_return(filing_date, start_offset, horizon, price_df, market_df):
+    """
+    Compute abnormal return from t+start_offset to t+start_offset+horizon.
+    start_offset=1 skips the filing day (t=0) noise from algo traders.
+    """
     try:
-        closes = price_df["Close"].dropna()
-        closes.index = pd.to_datetime(closes.index)
-        closes = closes.sort_index()
+        c = price_df["Close"].dropna().sort_index()
+        c.index = pd.to_datetime(c.index)
+        m = market_df["Close"].dropna().sort_index() if market_df is not None else None
+        m.index = pd.to_datetime(m.index)
 
-        future = closes[closes.index >= filing_date]
-        if len(future) < horizon + 1:
-            return np.nan
+        fut_c = c[c.index >= filing_date]
+        if len(fut_c) < start_offset + horizon + 1: return np.nan, np.nan, np.nan
 
-        return float((future.iloc[horizon] - future.iloc[0]) / future.iloc[0])
-    except Exception as e:
-        logger.warning(f"Price return failed at {filing_date}: {e}")
-        return np.nan
+        p_start = fut_c.iloc[start_offset]
+        p_end   = fut_c.iloc[start_offset + horizon]
+        stock_ret = (p_end - p_start) / p_start
 
+        if m is not None:
+            fut_m = m[m.index >= filing_date]
+            if len(fut_m) < start_offset + horizon + 1:
+                return float(stock_ret), np.nan, float(stock_ret)
+            m_start = fut_m.iloc[start_offset]
+            m_end   = fut_m.iloc[start_offset + horizon]
+            market_ret = (m_end - m_start) / m_start
+            abnormal_ret = stock_ret - market_ret
+            return float(stock_ret), float(market_ret), float(abnormal_ret)
+        return float(stock_ret), np.nan, float(stock_ret)
+    except: return np.nan, np.nan, np.nan
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def impute_cols(df, cols):
+    df = df.copy()
+    for col in cols:
+        if col not in df.columns: continue
+        cm = df.groupby("ticker")[col].transform("median")
+        gm = df[col].median()
+        df[col] = df[col].fillna(cm).fillna(gm).fillna(0.0)
+    return df
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig):
-    # Load tickers
-    tickers_file = cfg.data.tickers_file
-    if not os.path.exists(tickers_file):
-        raise FileNotFoundError(f"Tickers file not found: {tickers_file}")
-    with open(tickers_file) as f:
-        tickers = [line.strip() for line in f if line.strip()]
-    logger.info(f"Loaded {len(tickers)} tickers from {tickers_file}")
+    with open(cfg.data.tickers_file) as f:
+        tickers = [l.strip() for l in f if l.strip()]
+    logger.info(f"Loaded {len(tickers)} tickers")
 
     sec_dir = os.path.join(cfg.data.raw_dir, "sec_filings")
     processed_dir = cfg.data.processed_dir
-    horizon = cfg.features.prediction_horizon
+    text_col = f"section_{cfg.sec.sections[0]}"
     os.makedirs(processed_dir, exist_ok=True)
 
-    text_col = f"section_{cfg.sec.sections[0]}"
-    all_records = []
-    skipped = []
+    logger.info("Downloading SPY benchmark...")
+    try:
+        spy_df = yf.download("SPY", start=cfg.data.start_date,
+                              end=cfg.data.end_date, auto_adjust=True, progress=False)
+        if isinstance(spy_df.columns, pd.MultiIndex):
+            spy_df.columns = spy_df.columns.get_level_values(0)
+    except: spy_df = None
+
+    all_records, skipped = [], []
 
     for ticker in tickers:
-        # ── Load SEC filings ──────────────────────────────────────────────
-        parquet_path = os.path.join(sec_dir, f"{ticker}_filings.parquet")
-        if not os.path.exists(parquet_path):
-            logger.warning(f"{ticker}: No SEC filings found, skipping.")
-            skipped.append(ticker)
-            continue
-
-        filings_df = pd.read_parquet(parquet_path)
-        filings_df["filed_at"] = pd.to_datetime(filings_df["filed_at"])
-        filings_df = filings_df.sort_values("filed_at").reset_index(drop=True)
-
-        has_text = filings_df[text_col].notna().sum()
-        if has_text == 0:
-            logger.warning(f"{ticker}: No text extracted, skipping.")
-            skipped.append(ticker)
-            continue
-
-        logger.info(f"{ticker}: {has_text}/{len(filings_df)} filings have text")
-
-        # ── Download price data ───────────────────────────────────────────
+        pp = os.path.join(sec_dir, f"{ticker}_filings.parquet")
+        if not os.path.exists(pp): skipped.append(ticker); continue
+        fdf = pd.read_parquet(pp)
+        fdf["filed_at"] = pd.to_datetime(fdf["filed_at"])
+        fdf = fdf.sort_values("filed_at").reset_index(drop=True)
+        if fdf[text_col].notna().sum() == 0: skipped.append(ticker); continue
         try:
-            price_df = yf.download(
-                ticker,
-                start=cfg.data.start_date,
-                end=cfg.data.end_date,
-                auto_adjust=True,
-                progress=False,
-            )
-            if price_df.empty:
-                logger.warning(f"{ticker}: Empty price data, skipping.")
-                skipped.append(ticker)
-                continue
-        except Exception as e:
-            logger.error(f"{ticker}: Price download failed: {e}")
-            skipped.append(ticker)
-            continue
+            pdf = yf.download(ticker, start=cfg.data.start_date,
+                               end=cfg.data.end_date, auto_adjust=True, progress=False)
+            if pdf.empty: skipped.append(ticker); continue
+        except: skipped.append(ticker); continue
+        if isinstance(pdf.columns, pd.MultiIndex):
+            pdf.columns = pdf.columns.get_level_values(0)
 
-        # Flatten MultiIndex columns if present (yfinance quirk)
-        if isinstance(price_df.columns, pd.MultiIndex):
-            price_df.columns = price_df.columns.get_level_values(0)
+        # Text features
+        fdf["cosine_sim_prev"] = cosine_sim_consecutive(fdf[text_col])
+        fdf["risk_drift_4q"]   = compute_risk_drift_4q(fdf["cosine_sim_prev"])
+        fdf["filing_surprise"] = compute_filing_surprise(fdf["cosine_sim_prev"])
+        ml = fdf[text_col].apply(lambda x: len(x.split()) if isinstance(x,str) else np.nan).mean()
+        fdf["text_length_norm"] = fdf[text_col].apply(
+            lambda x: len(x.split()) if isinstance(x,str) else np.nan) / (ml if ml>0 else 1)
 
-        # ── Text features ─────────────────────────────────────────────────
-        filings_df["cosine_sim_prev"] = cosine_sim_consecutive(filings_df[text_col])
+        # LM sentiment
+        fdf = add_lm_features(fdf, text_col)
 
-        sentiment_rows = filings_df[text_col].apply(vader_sentiment)
-        sentiment_df = pd.DataFrame(sentiment_rows.tolist())
-        filings_df = pd.concat([filings_df.reset_index(drop=True),
-                                 sentiment_df.reset_index(drop=True)], axis=1)
+        # Price features
+        pf = pd.DataFrame(fdf["filed_at"].apply(
+            lambda d: get_price_features(d, pdf)).tolist())
+        fdf = pd.concat([fdf.reset_index(drop=True), pf.reset_index(drop=True)], axis=1)
 
-        filings_df["text_length"] = filings_df[text_col].apply(
-            lambda x: len(x.split()) if isinstance(x, str) else np.nan
-        )
-        mean_len = filings_df["text_length"].mean()
-        filings_df["text_length_norm"] = (
-            filings_df["text_length"] / mean_len if mean_len > 0 else np.nan
-        )
+        # Multi-horizon abnormal returns from t+1 (skip filing day)
+        for horizon in [5, 10, 20]:
+            stock_r, market_r, abnormal_r = zip(*fdf["filed_at"].apply(
+                lambda d: get_abnormal_return(d, 1, horizon, pdf, spy_df)).tolist())
+            fdf[f"stock_ret_{horizon}d"]    = stock_r
+            fdf[f"market_ret_{horizon}d"]   = market_r
+            fdf[f"abnormal_ret_{horizon}d"] = abnormal_r
+            fdf[f"target_{horizon}d"]       = (pd.Series(abnormal_r) > 0).astype(int).values
 
-        # ── Price features at filing date ─────────────────────────────────
-        price_feature_rows = filings_df["filed_at"].apply(
-            lambda d: get_price_features_at_filing(d, price_df)
-        )
-        price_feat_df = pd.DataFrame(price_feature_rows.tolist())
-        filings_df = pd.concat([filings_df.reset_index(drop=True),
-                                 price_feat_df.reset_index(drop=True)], axis=1)
+        # Primary target = 5-day abnormal from t+1
+        fdf["target"] = fdf["target_5d"]
 
-        # ── Target: price return after filing ─────────────────────────────
-        filings_df["price_return"] = filings_df["filed_at"].apply(
-            lambda d: get_price_return_after_filing(d, horizon, price_df)
-        )
-        filings_df["target"] = (filings_df["price_return"] > 0).astype(int)
+        # Interaction features (new in v3)
+        fdf["lm_neg_x_cosine"]       = fdf["lm_negative"] * (1 - fdf["cosine_sim_prev"].fillna(0.9))
+        fdf["lm_unc_x_drift"]        = fdf["lm_uncertainty"] * fdf["risk_drift_4q"].fillna(0)
+        fdf["text_price_divergence"] = fdf["lm_net_sentiment"].fillna(0) * (-fdf["price_return_20d"].fillna(0))
 
-        # ── Select final columns ──────────────────────────────────────────
-        record_cols = [
-            "filed_at", "ticker",
-            # Text features
-            "cosine_sim_prev",
-            "sentiment_compound", "sentiment_pos", "sentiment_neg",
-            "text_length_norm",
-            # Price features at filing date
-            "price_return_1d", "price_return_5d", "price_return_20d",
-            "price_volatility_20d", "price_ma_ratio_5", "price_ma_ratio_20",
-            "price_rsi",
-            # Target
-            "price_return", "target",
-        ]
-        available = [c for c in record_cols if c in filings_df.columns]
-        records = filings_df[available].dropna(subset=["target", "cosine_sim_prev"])
+        cols = ["filed_at","ticker",
+                "cosine_sim_prev","risk_drift_4q","filing_surprise","sector_contagion",
+                "lm_negative","lm_positive","lm_uncertainty","lm_litigious",
+                "lm_constraining","lm_net_sentiment",
+                "lm_negative_delta","lm_positive_delta","lm_uncertainty_delta","lm_litigious_delta",
+                "lm_neg_x_cosine","lm_unc_x_drift","text_price_divergence",
+                "text_length_norm",
+                "price_return_1d","price_return_5d","price_return_20d",
+                "price_volatility_20d","price_ma_ratio_5","price_ma_ratio_20","price_rsi",
+                "abnormal_ret_5d","abnormal_ret_10d","abnormal_ret_20d",
+                "target_5d","target_10d","target_20d","target"]
+        avail = [c for c in cols if c in fdf.columns]
+        rec = fdf[avail].dropna(subset=["target","cosine_sim_prev"])
+        logger.info(f"{ticker}: {len(rec)} rows")
+        all_records.append(rec)
 
-        logger.info(f"{ticker}: {len(records)} valid rows")
-        all_records.append(records)
+    final_df = pd.concat(all_records, ignore_index=True).sort_values("filed_at").reset_index(drop=True)
+    temporal_cols = ["risk_drift_4q","filing_surprise",
+                     "lm_negative_delta","lm_positive_delta",
+                     "lm_uncertainty_delta","lm_litigious_delta"]
+    final_df = impute_cols(final_df, temporal_cols)
 
-    if not all_records:
-        logger.error("No data collected. Exiting.")
-        return
+    logger.info("Computing sector contagion...")
+    final_df["sector_contagion"] = compute_sector_contagion(final_df)
+    sec_med = final_df.groupby(final_df["ticker"].map(SECTOR_MAP))["sector_contagion"].transform("median")
+    final_df["sector_contagion"] = final_df["sector_contagion"].fillna(sec_med).fillna(
+        final_df["sector_contagion"].median())
 
-    # ── Combine and save ──────────────────────────────────────────────────
-    final_df = pd.concat(all_records, ignore_index=True)
-    final_df = final_df.sort_values("filed_at").reset_index(drop=True)
-
-    output_path = os.path.join(processed_dir, "filing_aligned.csv")
-    final_df.to_csv(output_path, index=False)
-
-    logger.info(f"\n{'='*50}")
-    logger.info(f"Dataset saved to {output_path}")
-    logger.info(f"Total rows:          {len(final_df)}")
-    logger.info(f"Tickers with data:   {final_df['ticker'].nunique()}")
-    logger.info(f"Tickers skipped:     {len(skipped)} → {skipped}")
-    logger.info(f"Date range:          {final_df['filed_at'].min()} → {final_df['filed_at'].max()}")
-    logger.info(f"Features:            {[c for c in final_df.columns if c not in ['filed_at','ticker','price_return','target']]}")
-    logger.info(f"Target distribution:\n{final_df['target'].value_counts()}")
-    logger.info(f"{'='*50}")
-
+    out = os.path.join(processed_dir, "filing_aligned.csv")
+    final_df.to_csv(out, index=False)
+    logger.info(f"Saved {len(final_df)} rows")
+    for h in [5,10,20]:
+        col = f"target_{h}d"
+        if col in final_df.columns:
+            vc = final_df[col].value_counts().to_dict()
+            logger.info(f"  target_{h}d: {vc}")
 
 if __name__ == "__main__":
     main()

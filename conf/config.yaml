@@ -3,7 +3,7 @@ seed: 42
 
 # Data configuration
 data:
-  tickers_file: "sp500_50.txt"
+  tickers_file: "sp500_tickers.txt"
   start_date: "2015-01-01"
   end_date: "2024-12-31"
   raw_dir: "data/raw"

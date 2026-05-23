@@ -28,6 +28,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.features.lm_features import add_lm_features, compute_lm_scores
+from src.dataloader.sector_benchmarks import (
+    fetch_all_benchmark_prices, get_benchmark_df_for_ticker, populate_sector_cache
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -198,13 +201,17 @@ def main(cfg: DictConfig):
 
     cache_dir = os.path.join(cfg.data.raw_dir, "finbert_cache")
 
-    logger.info("Downloading SPY benchmark...")
+    logger.info("Populating sector cache for all tickers...")
+    populate_sector_cache(tickers, fetch_if_unknown=True)
+
+    logger.info("Downloading sector ETF benchmarks (SPY + 11 sector ETFs)...")
     try:
-        spy_df = yf.download("SPY", start=cfg.data.start_date,
-                              end=cfg.data.end_date, auto_adjust=True, progress=False)
-        if isinstance(spy_df.columns, pd.MultiIndex):
-            spy_df.columns = spy_df.columns.get_level_values(0)
-    except: spy_df = None
+        etf_dfs = fetch_all_benchmark_prices(cfg.data.start_date, cfg.data.end_date)
+        spy_df = etf_dfs.get("SPY")  # kept as fallback
+    except Exception as e:
+        logger.warning(f"Benchmark download failed: {e}")
+        etf_dfs = {}
+        spy_df = None
 
     all_records, skipped = [], []
 
@@ -262,9 +269,11 @@ def main(cfg: DictConfig):
         fdf = pd.concat([fdf.reset_index(drop=True), pf.reset_index(drop=True)], axis=1)
 
         # ── Multi-horizon abnormal returns from t+1 (skip filing day) ──────
+        # SECTOR-ADJUSTED: use ticker's sector ETF (XLK, XLF, etc.) instead of SPY
+        ticker_benchmark = get_benchmark_df_for_ticker(ticker, etf_dfs) if etf_dfs else spy_df
         for horizon in [5, 10, 20]:
             stock_r, market_r, abnormal_r = zip(*fdf["filed_at"].apply(
-                lambda d: get_abnormal_return(d, 1, horizon, pdf, spy_df)).tolist())
+                lambda d: get_abnormal_return(d, 1, horizon, pdf, ticker_benchmark)).tolist())
             fdf[f"stock_ret_{horizon}d"]    = stock_r
             fdf[f"market_ret_{horizon}d"]   = market_r
             fdf[f"abnormal_ret_{horizon}d"] = abnormal_r

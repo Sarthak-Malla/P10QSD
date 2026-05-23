@@ -169,7 +169,7 @@ def mcnemar_test(y_true, y_pred, baseline_pred):
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig):
-    df = pd.read_csv(os.path.join(cfg.data.processed_dir,"filing_aligned.csv"),
+    df = pd.read_csv(os.path.join(cfg.data.processed_dir,"filing_aligned_v4.csv"),
                      parse_dates=["filed_at"])
     logger.info(f"Loaded {len(df)} rows, {df['ticker'].nunique()} tickers")
     seed = cfg.seed

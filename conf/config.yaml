@@ -30,4 +30,4 @@ training:
 sec:
   identity: "sarthak.malla@mbzuai.ac.ae"
   forms: ["10-Q"]
-  sections: ["part_ii_item_1a", "part_i_item_2"]
+  sections: ["part_ii_item_1a", "part_ii_item_1", "part_i_item_2", "part_i_item_3"]

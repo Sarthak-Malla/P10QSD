@@ -20,7 +20,7 @@ print("=" * 60)
 print("Approach 1: get_section() with name variants")
 print("=" * 60)
 for name in ["Item 2", "item2", "item 2", "Part I Item 2",
-             "Management's Discussion", "MD&A", "mda", "Part I, Item 2", "part_i_item_2", "part_ii_item_1a"]:
+             "Management's Discussion", "MD&A", "mda", "Part I, Item 2", "part_ii_item_1a", "part_ii_item_1", "part_i_item_2", "part_i_item_3"]:
     try:
         s = report.get_section(name)
         text = s.text(clean=True)[:200] if s else None

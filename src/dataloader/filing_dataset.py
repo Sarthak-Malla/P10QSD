@@ -18,38 +18,61 @@ Key fixes vs v3:
 6. Interaction features retained from v3.
 """
 import os, logging
+from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import hydra
+from tqdm.auto import tqdm
 from omegaconf import DictConfig
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.features.lm_features import add_lm_features, compute_lm_scores
-from src.dataloader.sector_benchmarks import (
-    fetch_all_benchmark_prices, get_benchmark_df_for_ticker, populate_sector_cache
-)
+from src.dataloader.company_metadata import get_ticker_metadata, get_ticker_sector
+from src.dataloader.sector_benchmarks import fetch_all_benchmark_prices, get_benchmark_df_for_ticker
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+class TqdmLoggingHandler(logging.Handler):
+    """Write log lines without breaking tqdm progress bars."""
+
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            print(self.format(record))
+
+
+def configure_logging():
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+configure_logging()
 logger = logging.getLogger(__name__)
 
-SECTOR_MAP = {
-    "AAPL":"Technology","MSFT":"Technology","GOOGL":"Technology","NVDA":"Technology",
-    "META":"Technology","TSLA":"Technology","CSCO":"Technology","QCOM":"Technology",
-    "INTC":"Technology","IBM":"Technology",
-    "JPM":"Finance","BAC":"Finance","GS":"Finance","WFC":"Finance","MS":"Finance",
-    "BLK":"Finance","AXP":"Finance","SPGI":"Finance","CB":"Finance","PGR":"Finance",
-    "JNJ":"Healthcare","UNH":"Healthcare","PFE":"Healthcare","ABBV":"Healthcare",
-    "MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare","DHR":"Healthcare",
-    "BMY":"Healthcare","AMGN":"Healthcare",
-    "AMZN":"Consumer","WMT":"Consumer","HD":"Consumer","MCD":"Consumer","SBUX":"Consumer",
-    "PG":"Consumer","KO":"Consumer","PEP":"Consumer","COST":"Consumer","NKE":"Consumer",
-    "CVX":"Energy","XOM":"Energy",
-    "CAT":"Industrial","UPS":"Industrial","RTX":"Industrial","NEE":"Industrial",
-    "LIN":"Industrial","BA":"Industrial","DE":"Industrial","MMM":"Industrial",
+
+SECTION_TITLES = {
+    "part_i_item_1": "Part I, Item 1 - Financial Statements",
+    "part_i_item_2": "Part I, Item 2 - MD&A",
+    "part_i_item_3": "Part I, Item 3 - Market Risk",
+    "part_i_item_4": "Part I, Item 4 - Controls and Procedures",
+    "part_ii_item_1": "Part II, Item 1 - Legal Proceedings",
+    "part_ii_item_1a": "Part II, Item 1A - Risk Factors",
+    "part_ii_item_2": "Part II, Item 2 - Equity Securities",
+    "part_ii_item_3": "Part II, Item 3 - Senior Securities Defaults",
+    "part_ii_item_4": "Part II, Item 4 - Mine Safety Disclosures",
+    "part_ii_item_5": "Part II, Item 5 - Other Information",
+    "part_ii_item_6": "Part II, Item 6 - Exhibits",
 }
+
+
+def section_title(section_key):
+    return SECTION_TITLES.get(section_key, section_key.replace("_", " ").title())
 
 def cosine_sim_consecutive(texts):
     sims = [np.nan]
@@ -72,16 +95,31 @@ def compute_filing_surprise(cosine_sims):
     es = cosine_sims.expanding(min_periods=2).std().replace(0, np.nan)
     return (cosine_sims - em) / es
 
-def compute_sector_contagion(df, window_days=45):
+def compute_sector_contagion(
+    df,
+    window_days=45,
+    metadata_path="data/reference/sp500_constituents.csv",
+    show_progress=False,
+):
     """
     Average cosine_sim_prev of sector peers whose filings arrived within
     the past `window_days` days (look-back only — no look-ahead bias).
     """
     df = df.copy()
-    df["sector"] = df["ticker"].map(SECTOR_MAP)
+    if "sector" in df.columns:
+        missing = df["sector"].isna() | (df["sector"] == "")
+        df.loc[missing, "sector"] = df.loc[missing, "ticker"].apply(
+            lambda t: get_ticker_sector(t, metadata_path=metadata_path)
+        )
+    else:
+        df["sector"] = df["ticker"].apply(lambda t: get_ticker_sector(t, metadata_path=metadata_path))
     df["filed_at"] = pd.to_datetime(df["filed_at"])
     contagion = []
-    for idx, row in df.iterrows():
+    rows = df.iterrows()
+    if show_progress:
+        rows = tqdm(rows, total=len(df), desc="sector contagion", unit="filing", dynamic_ncols=True)
+
+    for idx, row in rows:
         s = row["sector"]
         if pd.isna(s): contagion.append(np.nan); continue
         mask = ((df["sector"] == s) & (df["ticker"] != row["ticker"]) &
@@ -139,8 +177,10 @@ def get_abnormal_return(filing_date, start_offset, horizon, price_df, market_df)
     try:
         c = price_df["Close"].dropna().sort_index()
         c.index = pd.to_datetime(c.index)
-        m = market_df["Close"].dropna().sort_index() if market_df is not None else None
-        m.index = pd.to_datetime(m.index)
+        m = None
+        if market_df is not None:
+            m = market_df["Close"].dropna().sort_index()
+            m.index = pd.to_datetime(m.index)
 
         fut_c = c[c.index >= filing_date]
         if len(fut_c) < start_offset + horizon + 1: return np.nan, np.nan, np.nan
@@ -178,6 +218,47 @@ def impute_cols(df, cols):
         df[col] = df[col].fillna(cm).fillna(gm).fillna(0.0)
     return df
 
+
+def _cfg_get(cfg_obj, key, default=None):
+    if hasattr(cfg_obj, "get"):
+        return cfg_obj.get(key, default)
+    return getattr(cfg_obj, key, default)
+
+
+def resolve_section_columns(sec_cfg):
+    sections = list(_cfg_get(sec_cfg, "sections", []))
+    primary_default = sections[0] if sections else "part_ii_item_1a"
+    primary_section = _cfg_get(sec_cfg, "primary_section", primary_default)
+    mda_section = _cfg_get(sec_cfg, "mda_section", "part_i_item_2")
+    text_col = f"section_{primary_section}"
+    mda_col = f"section_{mda_section}" if mda_section else None
+    return text_col, mda_col
+
+
+def configured_section_columns(sec_cfg):
+    sections = list(_cfg_get(sec_cfg, "sections", []))
+    return [(section, f"section_{section}", section_title(section)) for section in sections]
+
+
+def update_section_stats(fdf, section_columns, section_stats):
+    """Track how often each configured SEC section exists in raw filing rows."""
+    filing_count = len(fdf)
+    for _, column, title in section_columns:
+        if column in fdf.columns:
+            values = fdf[column].replace("", np.nan)
+            available = int(values.notna().sum())
+            missing = int(filing_count - available)
+        else:
+            available = 0
+            missing = filing_count
+
+        section_stats[title]["available_filings"] += available
+        section_stats[title]["missing_filings"] += missing
+        if available > 0:
+            section_stats[title]["tickers_with_any"] += 1
+        else:
+            section_stats[title]["tickers_missing_all"] += 1
+
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig):
     with open(cfg.data.tickers_file) as f:
@@ -186,9 +267,13 @@ def main(cfg: DictConfig):
 
     sec_dir = os.path.join(cfg.data.raw_dir, "sec_filings")
     processed_dir = cfg.data.processed_dir
-    text_col = f"section_{cfg.sec.sections[0]}"
-    sections = list(cfg.sec.sections)
-    mda_col = f"section_{sections[1]}" if len(sections) > 1 else None
+    metadata_path = cfg.data.get("metadata_file", "data/reference/sp500_constituents.csv")
+    text_col, mda_col = resolve_section_columns(cfg.sec)
+    section_columns = configured_section_columns(cfg.sec)
+    primary_section = text_col.replace("section_", "", 1)
+    mda_section = mda_col.replace("section_", "", 1) if mda_col else None
+    primary_title = section_title(primary_section)
+    mda_title = section_title(mda_section) if mda_section else "disabled"
     os.makedirs(processed_dir, exist_ok=True)
 
     # Try to import FinBERT features (optional — degrades gracefully if not installed)
@@ -201,8 +286,15 @@ def main(cfg: DictConfig):
 
     cache_dir = os.path.join(cfg.data.raw_dir, "finbert_cache")
 
-    logger.info("Populating sector cache for all tickers...")
-    populate_sector_cache(tickers, fetch_if_unknown=True)
+    logger.info(
+        "Building filing dataset for %d tickers | primary=%s | mda=%s",
+        len(tickers), primary_title, mda_title,
+    )
+    logger.info(f"Using company metadata from {metadata_path}")
+    logger.info(
+        "Tracking section availability for: %s",
+        ", ".join(title for _, _, title in section_columns) if section_columns else "none",
+    )
 
     logger.info("Downloading sector ETF benchmarks (SPY + 11 sector ETFs)...")
     try:
@@ -214,105 +306,190 @@ def main(cfg: DictConfig):
         spy_df = None
 
     all_records, skipped = [], []
+    skip_reasons = Counter()
+    skip_details = defaultdict(list)
+    section_stats = defaultdict(Counter)
+    skipped_missing_metadata = []
 
-    for ticker in tickers:
-        pp = os.path.join(sec_dir, f"{ticker}_filings.parquet")
-        if not os.path.exists(pp): skipped.append(ticker); continue
-        fdf = pd.read_parquet(pp)
-        fdf["filed_at"] = pd.to_datetime(fdf["filed_at"])
-        fdf = fdf.sort_values("filed_at").reset_index(drop=True)
+    def record_skip(ticker, reason, detail=None):
+        skipped.append(ticker)
+        skip_reasons[reason] += 1
+        skip_details[reason].append(f"{ticker}: {detail}" if detail else ticker)
 
-        # Normalise empty strings → NaN so downstream checks work uniformly
-        fdf[text_col] = fdf[text_col].replace("", np.nan)
-        if mda_col and mda_col in fdf.columns:
-            fdf[mda_col] = fdf[mda_col].replace("", np.nan)
+    success_tickers = 0
+    total_rows = 0
 
-        # Drop individual filings where Item 1A is missing — they have no primary text
-        fdf = fdf[fdf[text_col].notna()].reset_index(drop=True)
-        if len(fdf) == 0: skipped.append(ticker); continue
-        try:
-            pdf = yf.download(ticker, start=cfg.data.start_date,
-                               end=cfg.data.end_date, auto_adjust=True, progress=False)
-            if pdf.empty: skipped.append(ticker); continue
-        except: skipped.append(ticker); continue
-        if isinstance(pdf.columns, pd.MultiIndex):
-            pdf.columns = pdf.columns.get_level_values(0)
-
-        # ── Item 1A (risk factors) text features ─────────────────────────
-        fdf["cosine_sim_prev"] = cosine_sim_consecutive(fdf[text_col])
-        fdf["risk_drift_4q"]   = compute_risk_drift_4q(fdf["cosine_sim_prev"])
-        fdf["filing_surprise"] = compute_filing_surprise(fdf["cosine_sim_prev"])
-        ml = fdf[text_col].apply(lambda x: len(x.split()) if isinstance(x,str) else np.nan).mean()
-        fdf["text_length_norm"] = fdf[text_col].apply(
-            lambda x: len(x.split()) if isinstance(x,str) else np.nan) / (ml if ml>0 else 1)
-
-        # LM sentiment on Item 1A
-        fdf = add_lm_features(fdf, text_col)
-
-        # ── MD&A (Item 2) text features ───────────────────────────────────
-        if mda_col and mda_col in fdf.columns and fdf[mda_col].notna().sum() > 0:
-            fdf["cosine_sim_prev_mda"] = cosine_sim_consecutive(fdf[mda_col])
-            fdf = _add_lm_features_suffixed(fdf, mda_col, "_mda")
-
-        # ── FinBERT cosine similarity ──────────────────────────────────────
-        if finbert_available:
+    with tqdm(tickers, desc="filing dataset", unit="ticker", dynamic_ncols=True) as progress:
+        for ticker in progress:
+            last_status = "start"
             try:
-                fdf["finbert_cosine_sim"] = compute_finbert_similarity(
-                    fdf, text_col, ticker, cache_dir=cache_dir)
+                metadata = get_ticker_metadata(ticker, metadata_path=metadata_path)
+                if metadata["gics_sector"] == "Unknown" or metadata["sector_etf"] == "SPY":
+                    record_skip(ticker, "missing_sector_metadata")
+                    skipped_missing_metadata.append(ticker)
+                    last_status = "skip:metadata"
+                    continue
+
+                pp = os.path.join(sec_dir, f"{ticker}_filings.parquet")
+                if not os.path.exists(pp):
+                    record_skip(ticker, "missing_sec_parquet")
+                    last_status = "skip:no_sec_file"
+                    continue
+
+                fdf = pd.read_parquet(pp)
+                fdf["filed_at"] = pd.to_datetime(fdf["filed_at"])
+                fdf = fdf.sort_values("filed_at").reset_index(drop=True)
+                update_section_stats(fdf, section_columns, section_stats)
+
+                # Normalise empty strings to NaN so downstream checks work uniformly.
+                if text_col not in fdf.columns:
+                    record_skip(ticker, "missing_primary_section_column", text_col)
+                    last_status = "skip:primary_col"
+                    continue
+                fdf[text_col] = fdf[text_col].replace("", np.nan)
+                if mda_col and mda_col in fdf.columns:
+                    fdf[mda_col] = fdf[mda_col].replace("", np.nan)
+
+                # Drop individual filings where the primary text is missing.
+                fdf = fdf[fdf[text_col].notna()].reset_index(drop=True)
+                if len(fdf) == 0:
+                    record_skip(ticker, "no_primary_section_text", primary_title)
+                    last_status = "skip:primary_text"
+                    continue
+
+                try:
+                    pdf = yf.download(
+                        ticker,
+                        start=cfg.data.start_date,
+                        end=cfg.data.end_date,
+                        auto_adjust=True,
+                        progress=False,
+                    )
+                    if pdf.empty:
+                        record_skip(ticker, "empty_price_data")
+                        last_status = "skip:no_prices"
+                        continue
+                except Exception as e:
+                    record_skip(ticker, "price_download_failed", str(e))
+                    last_status = "skip:price_error"
+                    continue
+                if isinstance(pdf.columns, pd.MultiIndex):
+                    pdf.columns = pdf.columns.get_level_values(0)
+
+                # Item 1A / primary section text features.
+                fdf["cosine_sim_prev"] = cosine_sim_consecutive(fdf[text_col])
+                fdf["risk_drift_4q"] = compute_risk_drift_4q(fdf["cosine_sim_prev"])
+                fdf["filing_surprise"] = compute_filing_surprise(fdf["cosine_sim_prev"])
+                ml = fdf[text_col].apply(lambda x: len(x.split()) if isinstance(x, str) else np.nan).mean()
+                fdf["text_length_norm"] = fdf[text_col].apply(
+                    lambda x: len(x.split()) if isinstance(x, str) else np.nan
+                ) / (ml if ml > 0 else 1)
+
+                fdf = add_lm_features(fdf, text_col)
+
+                # MD&A / configured secondary section text features.
+                if mda_col and mda_col in fdf.columns and fdf[mda_col].notna().sum() > 0:
+                    fdf["cosine_sim_prev_mda"] = cosine_sim_consecutive(fdf[mda_col])
+                    fdf = _add_lm_features_suffixed(fdf, mda_col, "_mda")
+
+                # FinBERT cosine similarity.
+                if finbert_available:
+                    try:
+                        fdf["finbert_cosine_sim"] = compute_finbert_similarity(
+                            fdf, text_col, ticker, cache_dir=cache_dir)
+                    except Exception as e:
+                        logger.warning(f"{ticker}: FinBERT failed: {e}")
+                        fdf["finbert_cosine_sim"] = np.nan
+
+                # Price features, including filing_day_return.
+                pf = pd.DataFrame(fdf["filed_at"].apply(
+                    lambda d: get_price_features(d, pdf)).tolist())
+                fdf = pd.concat([fdf.reset_index(drop=True), pf.reset_index(drop=True)], axis=1)
+
+                # Multi-horizon abnormal returns from t+1, skipping filing day.
+                sector = metadata["gics_sector"]
+                benchmark_etf = metadata["sector_etf"]
+                ticker_benchmark = (
+                    get_benchmark_df_for_ticker(ticker, etf_dfs, metadata_path=metadata_path)
+                    if etf_dfs else spy_df
+                )
+                if not etf_dfs or benchmark_etf not in etf_dfs:
+                    benchmark_etf = "SPY"
+                fdf["sector"] = sector
+                fdf["benchmark_etf"] = benchmark_etf
+                for horizon in [5, 10, 20]:
+                    stock_r, market_r, abnormal_r = zip(*fdf["filed_at"].apply(
+                        lambda d: get_abnormal_return(d, 1, horizon, pdf, ticker_benchmark)).tolist())
+                    fdf[f"stock_ret_{horizon}d"] = stock_r
+                    fdf[f"market_ret_{horizon}d"] = market_r
+                    fdf[f"abnormal_ret_{horizon}d"] = abnormal_r
+                    target = pd.Series(abnormal_r, index=fdf.index)
+                    fdf[f"target_{horizon}d"] = np.where(target.notna(), (target > 0).astype(int), np.nan)
+
+                # Primary target = 5-day abnormal from t+1.
+                fdf["target"] = fdf["target_5d"]
+
+                # Interaction features.
+                fdf["lm_neg_x_cosine"] = fdf["lm_negative"] * (1 - fdf["cosine_sim_prev"].fillna(0.9))
+                fdf["lm_unc_x_drift"] = fdf["lm_uncertainty"] * fdf["risk_drift_4q"].fillna(0)
+                fdf["text_price_divergence"] = fdf["lm_net_sentiment"].fillna(0) * (-fdf["price_return_20d"].fillna(0))
+
+                cols = [
+                    "filed_at","ticker","sector","benchmark_etf",
+                    "cosine_sim_prev","risk_drift_4q","filing_surprise","sector_contagion",
+                    "lm_negative","lm_positive","lm_uncertainty","lm_litigious",
+                    "lm_constraining","lm_net_sentiment",
+                    "lm_negative_delta","lm_positive_delta","lm_uncertainty_delta","lm_litigious_delta",
+                    "lm_neg_x_cosine","lm_unc_x_drift","text_price_divergence",
+                    "text_length_norm",
+                    # MD&A features
+                    "cosine_sim_prev_mda",
+                    "lm_negative_mda","lm_positive_mda","lm_uncertainty_mda",
+                    "lm_litigious_mda","lm_net_sentiment_mda",
+                    # FinBERT
+                    "finbert_cosine_sim",
+                    # Price features
+                    "price_return_1d","price_return_5d","price_return_20d",
+                    "price_volatility_20d","price_ma_ratio_5","price_ma_ratio_20","price_rsi",
+                    "filing_day_return",
+                    # Targets
+                    "stock_ret_5d","stock_ret_10d","stock_ret_20d",
+                    "market_ret_5d","market_ret_10d","market_ret_20d",
+                    "abnormal_ret_5d","abnormal_ret_10d","abnormal_ret_20d",
+                    "target_5d","target_10d","target_20d","target",
+                ]
+                avail = [c for c in cols if c in fdf.columns]
+                rec = fdf[avail].dropna(subset=["target", "cosine_sim_prev"])
+                if rec.empty:
+                    record_skip(ticker, "no_usable_rows_after_cleaning")
+                    last_status = "skip:no_rows"
+                    continue
+
+                all_records.append(rec)
+                success_tickers += 1
+                total_rows += len(rec)
+                last_status = f"ok:{ticker}:{len(rec)}"
             except Exception as e:
-                logger.warning(f"{ticker}: FinBERT failed: {e}")
-                fdf["finbert_cosine_sim"] = np.nan
+                record_skip(ticker, "ticker_error", str(e))
+                logger.warning(f"{ticker}: unexpected processing error: {e}")
+                last_status = "skip:error"
+            finally:
+                section_ok = sum(c["available_filings"] for c in section_stats.values())
+                section_missing = sum(c["missing_filings"] for c in section_stats.values())
+                progress.set_postfix({
+                    "ok": success_tickers,
+                    "rows": total_rows,
+                    "skip": sum(skip_reasons.values()),
+                    "sec_ok": section_ok,
+                    "sec_missing": section_missing,
+                    "last": last_status,
+                }, refresh=True)
 
-        # ── Price features (includes filing_day_return) ────────────────────
-        pf = pd.DataFrame(fdf["filed_at"].apply(
-            lambda d: get_price_features(d, pdf)).tolist())
-        fdf = pd.concat([fdf.reset_index(drop=True), pf.reset_index(drop=True)], axis=1)
-
-        # ── Multi-horizon abnormal returns from t+1 (skip filing day) ──────
-        # SECTOR-ADJUSTED: use ticker's sector ETF (XLK, XLF, etc.) instead of SPY
-        ticker_benchmark = get_benchmark_df_for_ticker(ticker, etf_dfs) if etf_dfs else spy_df
-        for horizon in [5, 10, 20]:
-            stock_r, market_r, abnormal_r = zip(*fdf["filed_at"].apply(
-                lambda d: get_abnormal_return(d, 1, horizon, pdf, ticker_benchmark)).tolist())
-            fdf[f"stock_ret_{horizon}d"]    = stock_r
-            fdf[f"market_ret_{horizon}d"]   = market_r
-            fdf[f"abnormal_ret_{horizon}d"] = abnormal_r
-            fdf[f"target_{horizon}d"]       = (pd.Series(abnormal_r) > 0).astype(int).values
-
-        # Primary target = 5-day abnormal from t+1
-        fdf["target"] = fdf["target_5d"]
-
-        # ── Interaction features ───────────────────────────────────────────
-        fdf["lm_neg_x_cosine"]       = fdf["lm_negative"] * (1 - fdf["cosine_sim_prev"].fillna(0.9))
-        fdf["lm_unc_x_drift"]        = fdf["lm_uncertainty"] * fdf["risk_drift_4q"].fillna(0)
-        fdf["text_price_divergence"] = fdf["lm_net_sentiment"].fillna(0) * (-fdf["price_return_20d"].fillna(0))
-
-        cols = [
-            "filed_at","ticker",
-            "cosine_sim_prev","risk_drift_4q","filing_surprise","sector_contagion",
-            "lm_negative","lm_positive","lm_uncertainty","lm_litigious",
-            "lm_constraining","lm_net_sentiment",
-            "lm_negative_delta","lm_positive_delta","lm_uncertainty_delta","lm_litigious_delta",
-            "lm_neg_x_cosine","lm_unc_x_drift","text_price_divergence",
-            "text_length_norm",
-            # MD&A features
-            "cosine_sim_prev_mda",
-            "lm_negative_mda","lm_positive_mda","lm_uncertainty_mda",
-            "lm_litigious_mda","lm_net_sentiment_mda",
-            # FinBERT
-            "finbert_cosine_sim",
-            # Price features
-            "price_return_1d","price_return_5d","price_return_20d",
-            "price_volatility_20d","price_ma_ratio_5","price_ma_ratio_20","price_rsi",
-            "filing_day_return",
-            # Targets
-            "abnormal_ret_5d","abnormal_ret_10d","abnormal_ret_20d",
-            "target_5d","target_10d","target_20d","target",
-        ]
-        avail = [c for c in cols if c in fdf.columns]
-        rec = fdf[avail].dropna(subset=["target","cosine_sim_prev"])
-        logger.info(f"{ticker}: {len(rec)} rows")
-        all_records.append(rec)
+    if not all_records:
+        logger.error("No usable filing records were produced; filing_aligned.csv was not written.")
+        if skip_reasons:
+            logger.info("Skip summary: %s", dict(skip_reasons))
+        return
 
     final_df = pd.concat(all_records, ignore_index=True).sort_values("filed_at").reset_index(drop=True)
     temporal_cols = ["risk_drift_4q","filing_surprise",
@@ -330,14 +507,53 @@ def main(cfg: DictConfig):
     final_df = impute_cols(final_df, temporal_cols + optional_cols)
 
     logger.info("Computing sector contagion (look-back only)...")
-    final_df["sector_contagion"] = compute_sector_contagion(final_df)
-    sec_med = final_df.groupby(final_df["ticker"].map(SECTOR_MAP))["sector_contagion"].transform("median")
+    final_df["sector_contagion"] = compute_sector_contagion(
+        final_df,
+        metadata_path=metadata_path,
+        show_progress=True,
+    )
+    sec_med = final_df.groupby("sector")["sector_contagion"].transform("median")
     final_df["sector_contagion"] = final_df["sector_contagion"].fillna(sec_med).fillna(
         final_df["sector_contagion"].median())
 
     out = os.path.join(processed_dir, "filing_aligned.csv")
     final_df.to_csv(out, index=False)
     logger.info(f"Saved {len(final_df)} rows to {out}")
+    logger.info(
+        "Ticker processing summary: %d succeeded, %d skipped, %d usable filing rows",
+        success_tickers, sum(skip_reasons.values()), len(final_df),
+    )
+    if skip_reasons:
+        logger.info("Skip reasons:")
+        for reason, count in skip_reasons.most_common():
+            examples = ", ".join(skip_details[reason][:8])
+            if len(skip_details[reason]) > 8:
+                examples += ", ..."
+            logger.info("  %-34s %4d | %s", reason, count, examples)
+
+    if section_stats:
+        logger.info("Section availability before row filtering:")
+        for title, stats in section_stats.items():
+            available = stats["available_filings"]
+            missing = stats["missing_filings"]
+            total = available + missing
+            pct = (available / total * 100) if total else 0.0
+            logger.info(
+                "  %-44s available=%5d missing=%5d available_pct=%5.1f%% "
+                "tickers_with_any=%3d tickers_missing_all=%3d",
+                title,
+                available,
+                missing,
+                pct,
+                stats["tickers_with_any"],
+                stats["tickers_missing_all"],
+            )
+    if skipped_missing_metadata:
+        logger.info(
+            "Skipped %d tickers with missing sector metadata: %s",
+            len(skipped_missing_metadata),
+            ", ".join(sorted(skipped_missing_metadata)),
+        )
     for h in [5, 10, 20]:
         col = f"target_{h}d"
         if col in final_df.columns:

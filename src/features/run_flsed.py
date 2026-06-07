@@ -17,33 +17,10 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/../.."))
 
 from src.features.flsed import compute_flsed_features, build_sector_peer_pool
+from src.dataloader.company_metadata import get_ticker_sector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("run_flsed")
-
-SECTOR_MAP = {
-    "AAPL":"Tech","MSFT":"Tech","GOOGL":"Tech","GOOG":"Tech","NVDA":"Tech","META":"Tech","TSLA":"Tech",
-    "ADBE":"Tech","CRM":"Tech","ORCL":"Tech","CSCO":"Tech","INTC":"Tech","AMD":"Tech","IBM":"Tech",
-    "QCOM":"Tech","TXN":"Tech","AVGO":"Tech","MU":"Tech","AMAT":"Tech","ADI":"Tech","LRCX":"Tech",
-    "KLAC":"Tech","NOW":"Tech","INTU":"Tech","SNPS":"Tech","CDNS":"Tech","PANW":"Tech","FTNT":"Tech",
-    "JPM":"Fin","BAC":"Fin","WFC":"Fin","C":"Fin","GS":"Fin","MS":"Fin","BLK":"Fin","SPGI":"Fin",
-    "AXP":"Fin","V":"Fin","MA":"Fin","COF":"Fin","USB":"Fin","PNC":"Fin","TFC":"Fin","SCHW":"Fin",
-    "CB":"Fin","PGR":"Fin","MMC":"Fin","ICE":"Fin","CME":"Fin","AON":"Fin","TRV":"Fin","AFL":"Fin",
-    "JNJ":"Health","PFE":"Health","MRK":"Health","ABBV":"Health","TMO":"Health","ABT":"Health","LLY":"Health",
-    "DHR":"Health","BMY":"Health","AMGN":"Health","GILD":"Health","CVS":"Health","CI":"Health","HUM":"Health",
-    "ISRG":"Health","SYK":"Health","BSX":"Health","MDT":"Health","REGN":"Health","VRTX":"Health","ZTS":"Health",
-    "ELV":"Health","UNH":"Health","BDX":"Health","BIIB":"Health",
-    "WMT":"Cons","COST":"Cons","HD":"Cons","LOW":"Cons","TGT":"Cons","PG":"Cons","KO":"Cons","PEP":"Cons",
-    "MO":"Cons","PM":"Cons","NKE":"Cons","SBUX":"Cons","MCD":"Cons","CL":"Cons","KMB":"Cons","GIS":"Cons",
-    "HSY":"Cons","K":"Cons","KHC":"Cons","CAG":"Cons","ADM":"Cons","TSN":"Cons","CPB":"Cons","MKC":"Cons",
-    "BKNG":"Cons","ABNB":"Cons","HLT":"Cons","MAR":"Cons","DIS":"Cons","NFLX":"Cons","CMCSA":"Cons",
-    "AMZN":"Cons","EBAY":"Cons","ETSY":"Cons",
-    "XOM":"Energy","CVX":"Energy","COP":"Energy","SLB":"Energy","EOG":"Energy","PXD":"Energy","OXY":"Energy",
-    "PSX":"Energy","VLO":"Energy","MPC":"Energy","HES":"Energy","FANG":"Energy","DVN":"Energy",
-    "BA":"Ind","CAT":"Ind","DE":"Ind","HON":"Ind","LMT":"Ind","RTX":"Ind","GE":"Ind","MMM":"Ind",
-    "UPS":"Ind","FDX":"Ind","ETN":"Ind","ITW":"Ind","EMR":"Ind","PH":"Ind","NSC":"Ind","UNP":"Ind",
-    "CSX":"Ind","LUV":"Ind","DAL":"Ind","UAL":"Ind","AAL":"Ind","CMI":"Ind","NOC":"Ind","GD":"Ind",
-}
 
 INPUT_CSV  = "data/processed/filing_aligned.csv"
 PARQUET_DIR = "data/raw/sec_filings"
@@ -101,6 +78,9 @@ def main():
     logger.info(f"Loading {INPUT_CSV}...")
     df = pd.read_csv(INPUT_CSV, parse_dates=["filed_at"])
     logger.info(f"Loaded {len(df)} feature rows from {df['ticker'].nunique()} tickers")
+    if "sector" not in df.columns:
+        df["sector"] = df["ticker"].apply(get_ticker_sector)
+    df["sector"] = df["sector"].fillna("Unknown")
 
     text_df = load_all_text()
     if len(text_df) == 0:
@@ -127,7 +107,14 @@ def main():
     logger.info("STEP 1/2: Building sector peer sentence pool (one-time)")
     logger.info("=" * 60)
     merged_for_pool = merged.dropna(subset=["text"]).copy()
-    peer_pool = build_sector_peer_pool(merged_for_pool, SECTOR_MAP, text_col="text")
+    sector_map = (
+        merged_for_pool[["ticker", "sector"]]
+        .dropna()
+        .drop_duplicates("ticker", keep="last")
+        .set_index("ticker")["sector"]
+        .to_dict()
+    )
+    peer_pool = build_sector_peer_pool(merged_for_pool, sector_map, text_col="text")
 
     logger.info("=" * 60)
     logger.info("STEP 2/2: Computing FLSED features per ticker")
@@ -143,7 +130,7 @@ def main():
         if ticker_df["text"].notna().sum() == 0:
             continue
 
-        sector = SECTOR_MAP.get(ticker, "Other")
+        sector = sector_map.get(ticker, "Unknown")
         sector_pool = peer_pool.get(sector, {})
 
         try:

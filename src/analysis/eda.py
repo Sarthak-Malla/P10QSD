@@ -6,6 +6,7 @@ Saves all plots to outputs/eda/
 Also provides plot_caar() — CAAR event study callable from baseline.py.
 """
 import os
+import sys
 import logging
 import numpy as np
 import pandas as pd
@@ -16,31 +17,29 @@ import seaborn as sns
 import hydra
 from omegaconf import DictConfig
 
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/../.."))
+
+from src.dataloader.company_metadata import get_ticker_sector
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-SECTOR_MAP = {
-    "AAPL":"Technology","MSFT":"Technology","GOOGL":"Technology","NVDA":"Technology",
-    "META":"Technology","TSLA":"Technology","CSCO":"Technology","QCOM":"Technology",
-    "INTC":"Technology","IBM":"Technology",
-    "JPM":"Finance","BAC":"Finance","GS":"Finance","WFC":"Finance","MS":"Finance",
-    "BLK":"Finance","AXP":"Finance","SPGI":"Finance","CB":"Finance","PGR":"Finance",
-    "JNJ":"Healthcare","UNH":"Healthcare","PFE":"Healthcare","ABBV":"Healthcare",
-    "MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare","DHR":"Healthcare",
-    "BMY":"Healthcare","AMGN":"Healthcare",
-    "AMZN":"Consumer","WMT":"Consumer","HD":"Consumer","MCD":"Consumer","SBUX":"Consumer",
-    "PG":"Consumer","KO":"Consumer","PEP":"Consumer","COST":"Consumer","NKE":"Consumer",
-    "CVX":"Energy","XOM":"Energy",
-    "CAT":"Industrial","UPS":"Industrial","RTX":"Industrial","NEE":"Industrial",
-    "LIN":"Industrial","BA":"Industrial","DE":"Industrial","MMM":"Industrial",
-}
 REGIME_MAP = {
     2015:"calm",2016:"calm",2017:"bull",2018:"volatile",2019:"bull",
     2020:"crisis",2021:"recovery",2022:"volatile",2023:"recovery",2024:"bull",
 }
 SECTOR_COLORS = {
-    "Technology":"#4C72B0","Finance":"#DD8452","Healthcare":"#55A868",
-    "Consumer":"#C44E52","Energy":"#8172B3","Industrial":"#937860",
+    "Communication Services":"#4C72B0",
+    "Consumer Discretionary":"#DD8452",
+    "Consumer Staples":"#55A868",
+    "Energy":"#C44E52",
+    "Financials":"#8172B3",
+    "Health Care":"#937860",
+    "Industrials":"#56B4E9",
+    "Information Technology":"#009E73",
+    "Materials":"#E69F00",
+    "Real Estate":"#CC79A7",
+    "Utilities":"#7F7F7F",
 }
 
 def run_eda(df, output_dir):
@@ -49,7 +48,9 @@ def run_eda(df, output_dir):
     df["filed_at"] = pd.to_datetime(df["filed_at"])
     df["year"] = df["filed_at"].dt.year
     df["quarter"] = df["filed_at"].dt.to_period("Q").astype(str)
-    df["sector"] = df["ticker"].map(SECTOR_MAP).fillna("Other")
+    if "sector" not in df.columns:
+        df["sector"] = df["ticker"].apply(get_ticker_sector)
+    df["sector"] = df["sector"].fillna("Unknown")
     df["regime"] = df["year"].map(REGIME_MAP).fillna("unknown")
     logger.info(f"Dataset: {len(df)} rows, {df['ticker'].nunique()} tickers, {df['year'].min()}-{df['year'].max()}")
     _plot_target_by_year(df, output_dir)

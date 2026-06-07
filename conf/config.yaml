@@ -8,6 +8,7 @@ data:
   end_date: "2024-12-31"
   raw_dir: "data/raw"
   processed_dir: "data/processed"
+  metadata_file: "data/reference/sp500_constituents.csv"
 
 # Feature configuration
 features:
@@ -31,3 +32,5 @@ sec:
   identity: "sarthak.malla@mbzuai.ac.ae"
   forms: ["10-Q"]
   sections: ["part_ii_item_1a", "part_ii_item_1", "part_i_item_2", "part_i_item_3"]
+  primary_section: "part_ii_item_1a"
+  mda_section: "part_i_item_2"
